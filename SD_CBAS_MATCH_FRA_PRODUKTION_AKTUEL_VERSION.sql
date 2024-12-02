@@ -1,27 +1,43 @@
-/* -- CBAS kode fra produktionen version 4 fra Christian 2024  */
-USE RAR_PROJEKT;
+/* Version fra 19.11.2024 */
+
+
+USE RAR_PROJEKT
 GO
 
+-- Outputformat
+DROP TABLE IF EXISTS LON_HR.SD.SD_CBAS_MATCH;
+CREATE TABLE LON_HR.SD.SD_CBAS_MATCH (
+   INST                           varchar(2)
+  ,TJNR                           varchar(7)
+  ,CPR                            varchar(10)
+  ,NAVN                           varchar(100)
+  ,STAT                           varchar(1)
+  ,MATCH_INFO                     varchar(100)
+  ,BRUGERNAVN                     varchar(100)
+  ,EMAIL                          varchar(100)
+  ,CURRENT_ROW_ACTIV_EMPLOYMENT   int
+  ,SOR                            varchar(20)
+  ,LEVERANCEDATO_CBAS             date
+  ,OPDATERINGSDATO                datetime2
+);
+
+-- Person
 DROP TABLE IF EXISTS #Person;
-SELECT 
-   *
-  ,NULL AS TJNR_MATCH 
-  ,NULL AS CPR_INST_MATCH
-  ,NULL AS CPR_MATCH
+SELECT *
 INTO #Person
-FROM RAR_PROJEKT.WH.WH_SD_PERSON pers
+FROM RAR_PROJEKT.WH.WH_SD_PERSON
 WHERE 1 = 1
-  AND CONVERT(date, GETDATE()) BETWEEN START AND SLUT
+  AND CONVERT(date, GETDATE()) BETWEEN [START] AND SLUT
   AND INST NOT IN ('2P', 'ZZ');
 
- /* -- CBAS LeveranceDato er tilføjet af Søren 23.09.2024 */
+-- CBAS
 DROP TABLE IF EXISTS #CBAS;
 SELECT 
    *
   ,ROW_NUMBER() OVER(ORDER BY BRUGERNAVN) AS CBAS_ID 
   ,CPRNR AS CPR
-  ,LeveranceDato as LeveranceDato_CBAS
   ,COALESCE(CONCAT(LoenInstitutionskode, tjenestenr), 'UKENDT') AS TJNR
+  ,CASE WHEN email IS NULL THEN 0 ELSE 1 END AS HAR_EMAIL
   ,CASE
     WHEN Firmakode = '1309' THEN 'BI'
     WHEN Firmakode = '1401' THEN 'Ukendt' 
@@ -46,101 +62,63 @@ SELECT
 INTO #CBAS
 FROM RAR_PROJEKT.PSA.PSA_CBAS;
 
-/* -- Først matches på tjnr - hvis der er et match er dette altid et 1:1-match */
-UPDATE #Person
-SET TJNR_MATCH = cbas.CBAS_ID
-FROM #Person pers
-LEFT JOIN #CBAS cbas ON cbas.TJNR = pers.TJNR;
-
-/* -- Herefter matches på CPR OG institution - en række med en mail foretrækkes over en række uden en mail */
-WITH RankedInst AS
-(
-  SELECT 
-     *
-    ,ROW_NUMBER() OVER(PARTITION BY CPR, FIRMAKODE_INST ORDER BY CASE WHEN EMAIL IS NOT NULL THEN 1 ELSE NULL END DESC, BRUGER_UPDATEDDATETIME DESC) AS RN
-  FROM #CBAS
-)
-UPDATE #Person
-SET CPR_INST_MATCH = cbas.CBAS_ID
-FROM #Person pers
-LEFT JOIN RankedInst cbas ON cbas.CPR = pers.CPR AND cbas.FIRMAKODE_INST = pers.INST AND cbas.RN = 1;
-
-/* -- Til sidst matches kun på CPR - en række med en mail foretrækkes over en række uden en mail ligesom før */
-WITH RankedInst AS
-(
-  SELECT 
-     *
-    ,ROW_NUMBER() OVER(PARTITION BY CPR ORDER BY CASE WHEN EMAIL IS NOT NULL THEN 1 ELSE NULL END DESC, BRUGER_UPDATEDDATETIME DESC) AS RN
-  FROM #CBAS
-)
-UPDATE #Person
-SET CPR_MATCH = cbas.CBAS_ID
-FROM #Person pers
-LEFT JOIN RankedInst cbas ON cbas.CPR = pers.CPR AND cbas.RN = 1;
-
-/* -- I den endelige tabel vises kun ét gæt på brugernavn og email, samt en markering af hvordan gættet er fremkommet */
-DROP TABLE IF EXISTS #Output;
-SELECT
+-- Matches
+INSERT INTO LON_HR.SD.SD_CBAS_MATCH
+SELECT 
    src.INST
   ,src.TJNR
   ,src.CPR
   ,src.NAVN
   ,src.STAT
-  ,src.MATCH_INFO
-  ,cbas.BRUGERNAVN
-  ,cbas.EMAIL
-  ,cbas.LeveranceDato_CBAS
-INTO #Output
-FROM
-(
-  SELECT
-     *
-    ,CASE
-      WHEN TJNR_MATCH IS NOT NULL THEN 'Match på tjenestenummer'
-      WHEN CPR_INST_MATCH IS NOT NULL THEN 'Match på CPR-nummer og institution'
-      WHEN CPR_MATCH IS NOT NULL THEN 'Match på CPR-nummer'
+  ,NULL AS MATCH_INFO
+  ,(  SELECT TOP 1 CBAS_ID
+      FROM #CBAS cbas
+      WHERE cbas.CPR = src.CPR
+      ORDER BY
+         CASE WHEN cbas.TJNR = src.TJNR THEN 1 ELSE 0 END DESC
+        ,CASE WHEN cbas.FIRMAKODE_INST = src.INST THEN 1 ELSE 0 END DESC
+        ,cbas.Person_UpdatedDatetime DESC
+   ) AS BRUGERNAVN
+  ,(  SELECT TOP 1 CBAS_ID
+      FROM #CBAS cbas
+      WHERE cbas.CPR = src.CPR
+      ORDER BY
+         cbas.HAR_EMAIL DESC
+        ,CASE WHEN cbas.TJNR = src.TJNR THEN 1 ELSE 0 END DESC
+        ,CASE WHEN cbas.FIRMAKODE_INST = src.INST THEN 1 ELSE 0 END DESC
+        ,cbas.Person_UpdatedDatetime DESC
+   ) AS EMAIL
+  ,CASE WHEN STAT IN ('1', '3') THEN 1 ELSE 0 END AS CURRENT_ROW_ACTIV_EMPLOYMENT
+  ,sor.SOR
+  ,(SELECT MAX(LEVERANCEDATO) FROM #CBAS) AS LEVERANCEDATO_CBAS
+  ,GETDATE() AS OPDATERINGSDATO
+FROM #Person src
+LEFT JOIN RAR_PROJEKT.WH.Hospitalsforkortelse_SOR sor ON sor.Hospitalsforkortelse = src.INST;
+
+-- Match-info
+UPDATE LON_HR.SD.SD_CBAS_MATCH
+SET 
+   MATCH_INFO = CASE WHEN cbas_brugernavn.CPR IS NULL THEN 'Intet match' ELSE CONCAT(
+    'Brugernavn: ',
+    CASE 
+      WHEN cbas_brugernavn.TJNR = src.TJNR THEN 'Tjnr'
+      WHEN cbas_brugernavn.FIRMAKODE_INST = src.INST THEN 'CPR og inst'
+      WHEN cbas_brugernavn.CPR = src.CPR THEN 'Kun CPR'
       ELSE 'Intet match'
-     END AS MATCH_INFO
-    ,COALESCE(TJNR_MATCH, CPR_INST_MATCH, CPR_MATCH) AS CBAS_ID
-  FROM #Person
-) src
-LEFT JOIN #CBAS cbas ON cbas.CBAS_ID = src.CBAS_ID;
+    END,
+    ' / Mail: ',
+    CASE 
+      WHEN cbas_email.TJNR = src.TJNR THEN 'Tjnr'
+      WHEN cbas_email.FIRMAKODE_INST = src.INST THEN 'CPR og inst'
+      WHEN cbas_email.CPR = src.CPR THEN 'Kun CPR'
+      ELSE 'Intet match'
+    END
+   ) END
+  ,BRUGERNAVN = cbas_brugernavn.BRUGERNAVN
+  ,EMAIL = cbas_email.EMAIL
+FROM LON_HR.SD.SD_CBAS_MATCH src
+LEFT JOIN #CBAS cbas_brugernavn ON cbas_brugernavn.CBAS_ID = src.BRUGERNAVN
+LEFT JOIN #CBAS cbas_email ON cbas_email.CBAS_ID = src.EMAIL;
 
-/* -- I den endelige tabel vises kun ét gæt på brugernavn og email, samt en markering af hvordan gættet er fremkommet */
 SELECT *
-	FROM #Output;
-
-
-/* -- I tabellen til LON_HR sættes SOR plus opdateringsdato på tabellen Søren 23.09.2024  */
-
-DROP TABLE IF EXISTS LON_HR.SD.SD_CBAS_MATCH;
-
-SELECT 
-CBAS_EMAILINFO.INST,
-CBAS_EMAILINFO.TJNR,
-CBAS_EMAILINFO.CPR,
-CBAS_EMAILINFO.STAT,
-CBAS_EMAILINFO.NAVN,
-CBAS_EMAILINFO.MATCH_INFO,
-CBAS_EMAILINFO.BRUGERNAVN,
-CBAS_EMAILINFO.EMAIL,
-/* -- Current_row_activ_employment */
-CASE
-	WHEN CBAS_EMAILINFO.STAT='1' or CBAS_EMAILINFO.STAT='3' THEN 1
-	ELSE 0
-END AS Current_row_activ_employment,
-
-INST_SOR.SOR,
-CBAS_EMAILINFO.LeveranceDato_CBAS,
-CONVERT(datetime2 (0), GETDATE()) AS Opdateringsdato 
-	   INTO LON_HR.SD.SD_CBAS_MATCH
-		  FROM #Output CBAS_EMAILINFO
-			LEFT JOIN RAR_PROJEKT.WH.Hospitalsforkortelse_SOR  INST_SOR 
-				ON CBAS_EMAILINFO.INST = INST_SOR.Hospitalsforkortelse    
-					WHERE 1 = 1;
-
-/* -- Viser os outputtet fra SD_CBAS_EMAILINFO_NEWBETA */
-/*
-SELECT *
-	FROM LON_HR.SD.SD_CBAS_EMAILINFO_NEWBETA;
-*/
+FROM LON_HR.SD.SD_CBAS_MATCH;
